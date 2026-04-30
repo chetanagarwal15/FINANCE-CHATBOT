@@ -216,3 +216,6 @@ def chat_get(query: str):
 @app.get("/")
 def home():
     return {"status": "running"}
+
+def handler(request):
+    return app
