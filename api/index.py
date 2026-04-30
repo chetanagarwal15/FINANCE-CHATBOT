@@ -14,23 +14,26 @@ from pydantic import BaseModel
 # =========================
 load_dotenv()
 
+app = FastAPI()
+
 client_ai = Groq(api_key=os.getenv("GROQ_API_KEY"))
-mongo_client = MongoClient(os.getenv("MONGO_URI"))
+
+mongo_client = MongoClient(
+    os.getenv("MONGO_URI"),
+    serverSelectionTimeoutMS=5000
+)
 
 db = mongo_client["waelzyai"]
 collection = db["wz_transactions"]
 
-app = FastAPI()
+# =========================
+# CACHE
+# =========================
+cached_data = []
 
-# =========================
-# LOAD DATA
-# =========================
 def load_data():
-    return list(collection.find({}, {"_id": 0}))
+    return list(collection.find({}, {"_id": 0}).limit(1000))
 
-# =========================
-# NORMALIZE
-# =========================
 def normalize(tx):
     dt = None
 
@@ -61,53 +64,62 @@ def normalize(tx):
     else:
         amount = abs(amount)
 
+    balance = (
+        tx.get("balance") if tx.get("balance") is not None
+        else tx.get("running_balance") if tx.get("running_balance") is not None
+        else tx.get("current_balance")
+    )
+
     return {
         "date": dt,
         "amount": amount,
         "type": tx.get("type", "").lower(),
-        "desc": tx.get("short_description") or tx.get("description", ""),
-        "balance": tx.get("balance") or tx.get("running_balance") or tx.get("current_balance")
+        "balance": balance
     }
 
+def refresh_cache():
+    global cached_data
+    raw = load_data()
+    cached_data = [normalize(tx) for tx in raw]
+
 # =========================
-# AI PARSER (FIXED)
+# STARTUP
+# =========================
+@app.on_event("startup")
+def startup():
+    refresh_cache()
+
+# =========================
+# AI PARSER
 # =========================
 def parse_query_ai(query):
-    prompt = f"""
-Extract:
-- intent: balance / spent / received / transactions
-- days: number if present
-- month: month name if present
-
-Return ONLY JSON:
-{{
-  "intent": "",
-  "days": null,
-  "month": null
-}}
-
-Query: {query}
-"""
-
     try:
         response = client_ai.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{
+                "role": "user",
+                "content": f"""
+Extract:
+intent (balance/spent/received/transactions),
+days,
+month
+
+Return JSON only.
+
+Query: {query}
+"""
+            }],
             timeout=5
         )
+
         text = response.choices[0].message.content.strip()
+        return json.loads(re.search(r"\{.*\}", text, re.DOTALL).group())
 
-        try:
-            return json.loads(text)
-        except:
-            match = re.search(r"\{.*\}", text, re.DOTALL)
-            return json.loads(match.group())
-
-    except Exception:
+    except:
         return {"intent": "transactions", "days": None, "month": None}
 
 # =========================
-# DATE RANGE
+# DATE FILTER
 # =========================
 def get_date_range(parsed):
     today = datetime.now()
@@ -124,15 +136,10 @@ def get_date_range(parsed):
 
         m = months.get(parsed["month"].lower())
         if m:
-            start = datetime(today.year, m, 1)
-            end = datetime(today.year + (m // 12), (m % 12) + 1, 1)
-            return start, end
+            return datetime(today.year, m, 1), datetime(today.year, m % 12 + 1, 1)
 
     return None, None
 
-# =========================
-# FILTER
-# =========================
 def filter_data(data, start, end):
     if not start:
         return data
@@ -142,30 +149,28 @@ def filter_data(data, start, end):
 # CHATBOT
 # =========================
 def chatbot(query):
-    raw = load_data()
-    if not raw:
-        return "No data found in MongoDB"
+    data = cached_data
 
-    data = [normalize(tx) for tx in raw]
+    if not data:
+        return "No data found"
+
     q = query.lower()
 
-    # greeting
     if any(w in q for w in ["hi", "hello", "hey"]):
         return "Hey! Ask me about transactions, spent, or received."
 
-    # random text filter
-    if not any(w in q for w in ["spent","received","credit","debit","transaction","balance","month","days"]):
+    if not any(w in q for w in ["spent","received","credit","debit","transaction","balance","month","days","count"]):
         return "I can help with transactions, spent, or received."
 
-    # balance (from DB, not calculated)
+    # BALANCE FROM DB
     if "balance" in q:
-        latest = sorted([tx for tx in data if tx["date"]], key=lambda x: x["date"], reverse=True)
-        if latest and latest[0].get("balance") is not None:
-            return f"Current Balance: {latest[0]['balance']}"
-        return "Balance not available in data"
+        latest = sorted(data, key=lambda x: x["date"] or datetime.min, reverse=True)
+        if latest and latest[0]["balance"] is not None:
+            return f"💰 Current Balance: {latest[0]['balance']}"
+        return "Balance not available"
 
     parsed = parse_query_ai(query)
-    intent = (parsed.get("intent") or "").lower()
+    intent = parsed.get("intent")
 
     start, end = get_date_range(parsed)
     filtered = filter_data(data, start, end)
@@ -174,30 +179,28 @@ def chatbot(query):
         return "No transactions found"
 
     if "total transactions" in q or "count" in q:
-        return f"Total Transactions: {len(filtered)}"
+        return f"📊 Total Transactions: {len(filtered)}"
 
     spent = abs(sum(tx["amount"] for tx in filtered if tx["amount"] < 0))
     received = sum(tx["amount"] for tx in filtered if tx["amount"] > 0)
 
     if intent == "spent":
-        return f"Spent: {round(spent,2)}"
+        return f"💸 Spent: {round(spent,2)}"
 
     if intent == "received":
-        return f"Received: {round(received,2)}"
+        return f"💰 Received: {round(received,2)}"
 
-    # default → transactions
-    LIMIT = 20
+    # DEFAULT
     output = f"\nTransactions: {len(filtered)}\n\n"
 
-    for tx in filtered[:LIMIT]:
+    for tx in filtered[:20]:
         d = tx["date"].strftime("%Y-%m-%d") if tx["date"] else "N/A"
-        bal = tx.get("balance", "N/A")
-        output += f"{d} | {tx['type']} | {tx['amount']} | Balance: {bal}\n"
+        output += f"{d} | {tx['type']} | {tx['amount']} | Bal: {tx['balance']}\n"
 
     return output
 
 # =========================
-# FASTAPI ROUTE
+# ROUTES
 # =========================
 class ChatRequest(BaseModel):
     query: str
@@ -206,13 +209,10 @@ class ChatRequest(BaseModel):
 def chat(req: ChatRequest):
     return {"response": chatbot(req.query)}
 
-# =========================
-# CLI TEST
-# =========================
-if __name__ == "__main__":
-    print("\n🤖 AI Finance Bot Ready\n")
-    while True:
-        q = input("You: ")
-        if q.lower() == "exit":
-            break
-        print("Bot:", chatbot(q))
+@app.get("/chat")
+def chat_get(query: str):
+    return {"response": chatbot(query)}
+
+@app.get("/")
+def home():
+    return {"status": "running"}
