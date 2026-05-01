@@ -223,5 +223,3 @@ def chat_get(query: str):
 def home():
     return {"status": "running"}
 
-def handler(request):
-    return app
