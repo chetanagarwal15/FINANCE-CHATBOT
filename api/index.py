@@ -190,14 +190,20 @@ def chatbot(query):
     if intent == "received":
         return f"💰 Received: {round(received,2)}"
 
-    # DEFAULT
-    output = f"\nTransactions: {len(filtered)}\n\n"
+    transactions_list = []
 
     for tx in filtered[:20]:
-        d = tx["date"].strftime("%Y-%m-%d") if tx["date"] else "N/A"
-        output += f"{d} | {tx['type']} | {tx['amount']} | Bal: {tx['balance']}\n"
+        transactions_list.append({
+            "date": tx["date"].strftime("%Y-%m-%d") if tx["date"] else None,
+            "type": tx["type"],
+            "amount": tx["amount"],
+            "balance": tx.get("balance")
+    })
 
-    return output
+    return {
+        "total_transactions": len(filtered),
+        "transactions": transactions_list
+}
 
 # =========================
 # ROUTES
